@@ -105,14 +105,21 @@ class P2PChatNode:
         # устанавливает опции для сокета
         # позволяет повторно использовать адрес и порт
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        # позволяет нескольким процессам слушать один UDP порт (нужно для теста 127.0.0.x на одном ПК)
+        try:
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
+        except (AttributeError, OSError):
+            pass
         # позволяет отправлять UDP пакеты на все сетевые интерфейсы
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
         # привязывает сокет к адресу и порту
         try:
-            sock.bind((self.bind_ip, self.udp_port))
+            # На loopback-тесте (127.0.0.x) broadcast приходит на lo0, поэтому слушаем на 0.0.0.0
+            bind_addr = "0.0.0.0" if self.bind_ip.startswith("127.") else self.bind_ip
+            sock.bind((bind_addr, self.udp_port))
         except OSError as exc:
             raise RuntimeError(
-                f"Не удалось открыть UDP {self.bind_ip}:{self.udp_port}. Порт занят или адрес недоступен: {exc}"
+                f"Не удалось открыть UDP {bind_addr}:{self.udp_port}. Порт занят или адрес недоступен: {exc}"
             )
         sock.settimeout(1.0)
         self.udp_sock = sock
@@ -160,7 +167,8 @@ class P2PChatNode:
         # широковещательный адрес 255.255.255.255
         # порт UDP
         try:
-            self.udp_sock.sendto(data, ("255.255.255.255", self.udp_port))
+            bcast = "127.255.255.255" if self.bind_ip.startswith("127.") else "255.255.255.255"
+            self.udp_sock.sendto(data, (bcast, self.udp_port))
         except OSError:
             pass
 
@@ -182,7 +190,8 @@ class P2PChatNode:
         # широковещательный адрес 255.255.255.255
         # порт UDP
         try:
-            self.udp_sock.sendto(data, ("255.255.255.255", self.udp_port))
+            bcast = "127.255.255.255" if self.bind_ip.startswith("127.") else "255.255.255.255"
+            self.udp_sock.sendto(data, (bcast, self.udp_port))
         except OSError:
             pass
 
