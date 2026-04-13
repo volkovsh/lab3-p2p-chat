@@ -7,6 +7,7 @@ import struct
 import threading
 import time
 import uuid
+import sys
 from datetime import datetime
 from typing import Dict, List, Optional, Tuple
 
@@ -34,6 +35,9 @@ class P2PChatNode:
         self.tcp_port = tcp_port
         self.name = name
         self.node_id = f"{name}-{uuid.uuid4().hex[:8]}"
+        # Для локального теста на одном ПК (127.0.0.x) используем multicast,
+        # т.к. SO_REUSEPORT обычно распределяет UDP-пакеты между сокетами, а не дублирует.
+        self.loopback_multicast_group = "239.255.0.1"
 
         # событие для остановки узла
         self.running = threading.Event()
@@ -51,6 +55,10 @@ class P2PChatNode:
         # список для хранения истории событий
         self.history: List[str] = []
         self.history_lock = threading.Lock()
+
+        # чтобы не спамить "Обнаружен узел" на discovery heartbeat
+        self._discover_log_ts_by_id: Dict[str, float] = {}
+        self._discover_log_interval_s = 15.0
 
     # метод для получения текущего времени
     @staticmethod
@@ -71,12 +79,24 @@ class P2PChatNode:
         self.start_tcp_server()
 # создает поток для приема UDP сообщений
         threading.Thread(target=self.udp_discovery_loop, daemon=True).start()
+        # периодически повторяем discovery, чтобы узлы точно обнаруживали друг друга
+        threading.Thread(target=self.discovery_heartbeat_loop, daemon=True).start()
 
         # Первичное объявление о себе
         self.send_discovery_broadcast()
         self.log_event(
             f"Узел запущен: name={self.name}, id={self.node_id}, ip={self.bind_ip}, udp={self.udp_port}, tcp={self.tcp_port}"
         )
+
+    # периодическая рассылка discovery (на случай потерь/разного порядка запуска)
+    def discovery_heartbeat_loop(self) -> None:
+        while self.running.is_set():
+            self.send_discovery_broadcast()
+            # интервал небольшой для локального теста, но не спамим слишком часто
+            for _ in range(3):
+                if not self.running.is_set():
+                    return
+                time.sleep(1)
 # метод для остановки узла
 # останавливает UDP и TCP сервера и закрывает все соединения
     def stop(self) -> None:
@@ -110,19 +130,31 @@ class P2PChatNode:
             sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
         except (AttributeError, OSError):
             pass
-        # позволяет отправлять UDP пакеты на все сетевые интерфейсы
+        # включает broadcast (для обычной сети); для loopback-теста будем использовать multicast
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
         # привязывает сокет к адресу и порту
         try:
-            # На loopback-тесте (127.0.0.x) broadcast приходит на lo0, поэтому слушаем на 0.0.0.0
-            bind_addr = "0.0.0.0" if self.bind_ip.startswith("127.") else self.bind_ip
-            sock.bind((bind_addr, self.udp_port))
+            # Для discovery слушаем на всех интерфейсах (так проще для broadcast/multicast)
+            sock.bind(("0.0.0.0", self.udp_port))
         except OSError as exc:
             raise RuntimeError(
-                f"Не удалось открыть UDP {bind_addr}:{self.udp_port}. Порт занят или адрес недоступен: {exc}"
+                f"Не удалось открыть UDP 0.0.0.0:{self.udp_port}. Порт занят или адрес недоступен: {exc}"
             )
         sock.settimeout(1.0)
         self.udp_sock = sock
+
+        # Если тестируем несколько узлов на одном Mac через 127.0.0.x — включаем multicast на lo0.
+        if self.bind_ip.startswith("127."):
+            try:
+                # Выбираем интерфейс loopback для multicast-исходящих
+                sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_IF, socket.inet_aton("127.0.0.1"))
+                sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, 1)
+                sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_LOOP, 1)
+                mreq = socket.inet_aton(self.loopback_multicast_group) + socket.inet_aton("127.0.0.1")
+                sock.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, mreq)
+            except OSError:
+                # если multicast недоступен, дальше можно попробовать broadcast как fallback
+                pass
 # метод для запуска TCP сервера
 # создает сокет TCP и привязывает его к адресу и порту
     def start_tcp_server(self) -> None:
@@ -158,6 +190,8 @@ class P2PChatNode:
             "node_id": self.node_id,
             # имя узла
             "name": self.name,
+            # ip узла (важно для loopback-теста, где recvfrom может вернуть 127.0.0.1 для всех)
+            "ip": self.bind_ip,
             # порт TCP
             "tcp_port": self.tcp_port,
         }
@@ -167,8 +201,11 @@ class P2PChatNode:
         # широковещательный адрес 255.255.255.255
         # порт UDP
         try:
-            bcast = "127.255.255.255" if self.bind_ip.startswith("127.") else "255.255.255.255"
-            self.udp_sock.sendto(data, (bcast, self.udp_port))
+            if self.bind_ip.startswith("127."):
+                self.udp_sock.sendto(data, (self.loopback_multicast_group, self.udp_port))
+            else:
+                bcast = "255.255.255.255"
+                self.udp_sock.sendto(data, (bcast, self.udp_port))
         except OSError:
             pass
 
@@ -190,8 +227,11 @@ class P2PChatNode:
         # широковещательный адрес 255.255.255.255
         # порт UDP
         try:
-            bcast = "127.255.255.255" if self.bind_ip.startswith("127.") else "255.255.255.255"
-            self.udp_sock.sendto(data, (bcast, self.udp_port))
+            if self.bind_ip.startswith("127."):
+                self.udp_sock.sendto(data, (self.loopback_multicast_group, self.udp_port))
+            else:
+                bcast = "255.255.255.255"
+                self.udp_sock.sendto(data, (bcast, self.udp_port))
         except OSError:
             pass
 
@@ -229,12 +269,29 @@ class P2PChatNode:
                 peer_tcp = payload.get("tcp_port")
                 if not isinstance(peer_tcp, int):
                     continue
-# логируем обнаружение узла
-                self.log_event(f"Обнаружен узел: {peer_name} ({addr[0]}:{peer_tcp})")
-                self.connect_to_peer(addr[0], peer_tcp)
+# определяем ip узла (если передали в payload — используем его)
+                peer_ip = payload.get("ip")
+                if not isinstance(peer_ip, str) or not peer_ip:
+                    peer_ip = addr[0]
+                # если узел уже подключён — не спамим логом и не коннектимся повторно
+                with self.peers_lock:
+                    already_connected = node_id in self.peers_by_id
+                if already_connected:
+                    continue
+
+                # логируем discovery с rate-limit (на случай повторов до TCP)
+                now_ts = time.time()
+                last_ts = self._discover_log_ts_by_id.get(node_id, 0.0)
+                if now_ts - last_ts >= self._discover_log_interval_s:
+                    self._discover_log_ts_by_id[node_id] = now_ts
+                    self.log_event(f"Обнаружен узел: {peer_name} ({peer_ip}:{peer_tcp})")
+                self.connect_to_peer(peer_ip, peer_tcp, peer_id=node_id)
             elif mtype == "leave":
                 peer_name = payload.get("name", "unknown")
-                self.log_event(f"Узел отключился: {peer_name} ({addr[0]})")
+                peer_ip = payload.get("ip")
+                if not isinstance(peer_ip, str) or not peer_ip:
+                    peer_ip = addr[0]
+                self.log_event(f"Узел отключился: {peer_name} ({peer_ip})")
                 peer_id = payload.get("node_id")
                 if isinstance(peer_id, str):
                     with self.peers_lock:
@@ -276,14 +333,17 @@ class P2PChatNode:
 
     # метод для соединения с пиром
     # соединяется с пиром по IP и порту
-    def connect_to_peer(self, ip: str, port: int) -> None:
+    def connect_to_peer(self, ip: str, port: int, peer_id: Optional[str] = None) -> None:
         # проверяет, что IP и порт не совпадают с текущим узлом
         # Защита от соединения с собой
         if ip == self.bind_ip and port == self.tcp_port:
             return
 
-        # Если уже есть подключение к этому ip:port, второй раз не коннектимся
+        # Если уже знаем peer_id и он подключен — второй раз не коннектимся
         with self.peers_lock:
+            if peer_id and peer_id in self.peers_by_id:
+                return
+            # Если уже есть подключение к этому ip:port, второй раз не коннектимся
             for p in self.peers_by_sock.values():
                 if p.addr[0] == ip and p.addr[1] == port:
                     return
@@ -294,8 +354,11 @@ class P2PChatNode:
         # пытается соединиться с пиром
         try:
             sock.connect((ip, port))
-        except OSError:
+        except OSError as exc:
             sock.close()
+            # без спама: лог только если discovery дал peer_id (то есть это реальная попытка подключения)
+            if peer_id:
+                self.log_event(f"TCP connect не удался: {ip}:{port} ({exc})")
             return
         sock.settimeout(None)
         # создает пир для нового соединения
@@ -339,6 +402,12 @@ class P2PChatNode:
         name = payload.get("name")
         if not node_id or not name:
             return
+        # peer может подключиться с ephemeral-port (если это входящее соединение),
+        # поэтому заменяем addr на объявленные ip:tcp_port из hello (если они валидны).
+        advertised_ip = payload.get("ip")
+        advertised_tcp = payload.get("tcp_port")
+        if isinstance(advertised_ip, str) and advertised_ip and isinstance(advertised_tcp, int):
+            peer.addr = (advertised_ip, advertised_tcp)
         # проверяет, что этот node_id уже подключен, если да, то закрывает соединение с текущим пиром  
         with self.peers_lock:
             # Если этот node_id уже подключён, оставляем только одно соединение
@@ -506,6 +575,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--bind-ip", help="IP для bind (например, 127.0.0.1, 127.0.0.2)")
     parser.add_argument("--udp-port", type=int, help="UDP порт discovery")
     parser.add_argument("--tcp-port", type=int, help="TCP порт чата")
+    parser.add_argument(
+        "--no-stdin",
+        action="store_true",
+        help="Не читать stdin (полезно для запуска в фоне/автотестов)",
+    )
     return parser.parse_args()
 
 
@@ -551,31 +625,35 @@ def main() -> None:
         return
     # выводим справку
     print_help()
-    # цикл для ввода команд
+    # цикл для ввода команд (или фоновый режим без stdin)
     try:
-        while True:
-            try:
-                line = input().strip()
-            except EOFError:
-                break
-            except KeyboardInterrupt:
-                break
+        if args.no_stdin or not sys.stdin.isatty():
+            while True:
+                time.sleep(1)
+        else:
+            while True:
+                try:
+                    line = input().strip()
+                except EOFError:
+                    break
+                except KeyboardInterrupt:
+                    break
 
-            if not line:
-                continue
-            if line == "/quit":
-                break
-            if line == "/help":
-                print_help()
-                continue
-            if line == "/peers":
-                node.print_peers()
-                continue
-            if line == "/history":
-                node.print_history()
-                continue
+                if not line:
+                    continue
+                if line == "/quit":
+                    break
+                if line == "/help":
+                    print_help()
+                    continue
+                if line == "/peers":
+                    node.print_peers()
+                    continue
+                if line == "/history":
+                    node.print_history()
+                    continue
 
-            node.send_chat(line)
+                node.send_chat(line)
     finally:
         node.stop()
 
