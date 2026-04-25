@@ -37,7 +37,7 @@ class P2PChatNode:
         self.node_id = f"{name}-{uuid.uuid4().hex[:8]}"
         # Для локального теста на одном ПК (127.0.0.x) используем multicast,
         # т.к. SO_REUSEPORT обычно распределяет UDP-пакеты между сокетами, а не дублирует.
-        self.loopback_multicast_group = "239.255.0.1"
+        self.loopback_multicast_group = "239.255.255.255"
 
         # событие для остановки узла
         self.running = threading.Event()
@@ -45,6 +45,7 @@ class P2PChatNode:
 
         # сокеты для UDP и TCP
         self.udp_sock: Optional[socket.socket] = None
+        self.udp_send_sock: Optional[socket.socket] = None
         self.tcp_server: Optional[socket.socket] = None
 
         # словари для хранения пиров по id и сокету
@@ -113,6 +114,11 @@ class P2PChatNode:
                 self.udp_sock.close()
             except OSError:
                 pass
+        if self.udp_send_sock is not None:
+            try:
+                self.udp_send_sock.close()
+            except OSError:
+                pass
         if self.tcp_server is not None:
             try:
                 self.tcp_server.close()
@@ -143,17 +149,37 @@ class P2PChatNode:
         sock.settimeout(1.0)
         self.udp_sock = sock
 
+        # Отдельный сокет для отправки: привязываем к bind_ip, чтобы исходящий IP был именно он.
+        send_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        send_sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+        try:
+            send_sock.bind((self.bind_ip, 0))
+        except OSError as exc:
+            raise RuntimeError(
+                f"Не удалось открыть UDP sender {self.bind_ip}:0. Адрес недоступен: {exc}"
+            )
+        self.udp_send_sock = send_sock
+
         # Если тестируем несколько узлов на одном Mac через 127.0.0.x — включаем multicast на lo0.
         if self.bind_ip.startswith("127."):
             try:
-                # Выбираем интерфейс loopback для multicast-исходящих
-                sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_IF, socket.inet_aton("127.0.0.1"))
+                # Для теста на 127.0.0.x важно, чтобы multicast уходил с bind_ip,
+                # иначе все пакеты выглядят как отправленные с 127.0.0.1.
+                sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_IF, socket.inet_aton(self.bind_ip))
                 sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, 1)
                 sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_LOOP, 1)
-                mreq = socket.inet_aton(self.loopback_multicast_group) + socket.inet_aton("127.0.0.1")
+                mreq = socket.inet_aton(self.loopback_multicast_group) + socket.inet_aton(self.bind_ip)
                 sock.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, mreq)
             except OSError:
                 # если multicast недоступен, дальше можно попробовать broadcast как fallback
+                pass
+            try:
+                send_sock.setsockopt(
+                    socket.IPPROTO_IP, socket.IP_MULTICAST_IF, socket.inet_aton(self.bind_ip)
+                )
+                send_sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, 1)
+                send_sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_LOOP, 1)
+            except OSError:
                 pass
 # метод для запуска TCP сервера
 # создает сокет TCP и привязывает его к адресу и порту
@@ -179,7 +205,7 @@ class P2PChatNode:
     # отправляет сообщение о себе всем узлам в сети
     def send_discovery_broadcast(self) -> None:
         # проверяет, что сокет UDP открыт
-        if self.udp_sock is None:
+        if self.udp_send_sock is None:
             return
         # создает payload для сообщения
         payload = {
@@ -202,10 +228,10 @@ class P2PChatNode:
         # порт UDP
         try:
             if self.bind_ip.startswith("127."):
-                self.udp_sock.sendto(data, (self.loopback_multicast_group, self.udp_port))
+                self.udp_send_sock.sendto(data, (self.loopback_multicast_group, self.udp_port))
             else:
                 bcast = "255.255.255.255"
-                self.udp_sock.sendto(data, (bcast, self.udp_port))
+                self.udp_send_sock.sendto(data, (bcast, self.udp_port))
         except OSError:
             pass
 
@@ -213,13 +239,14 @@ class P2PChatNode:
     # отправляет сообщение о выходе из сети всем узлам в сети
     def send_leave_broadcast(self) -> None:
         # проверяет, что сокет UDP открыт
-        if self.udp_sock is None:
+        if self.udp_send_sock is None:
             return
         # создает payload для сообщения
         payload = {
             "type": "leave",
             "node_id": self.node_id,
             "name": self.name,
+            "ip": self.bind_ip,
         }
         # преобразует payload в JSON и кодирует в байты
         data = json.dumps(payload).encode("utf-8")
@@ -228,10 +255,10 @@ class P2PChatNode:
         # порт UDP
         try:
             if self.bind_ip.startswith("127."):
-                self.udp_sock.sendto(data, (self.loopback_multicast_group, self.udp_port))
+                self.udp_send_sock.sendto(data, (self.loopback_multicast_group, self.udp_port))
             else:
                 bcast = "255.255.255.255"
-                self.udp_sock.sendto(data, (bcast, self.udp_port))
+                self.udp_send_sock.sendto(data, (bcast, self.udp_port))
         except OSError:
             pass
 
@@ -351,6 +378,13 @@ class P2PChatNode:
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         # устанавливает таймаут для сокета
         sock.settimeout(3.0)
+        # Для тестов на одном ПК (127.0.0.x) обязательно привязываем исходящий TCP к bind_ip,
+        # иначе ОС может выбрать другой адрес из 127/8, и соединения/захват будут выглядеть "не от того узла".
+        try:
+            sock.bind((self.bind_ip, 0))
+        except OSError:
+            # если bind не удался — пробуем connect как есть (например, в обычной сети)
+            pass
         # пытается соединиться с пиром
         try:
             sock.connect((ip, port))
